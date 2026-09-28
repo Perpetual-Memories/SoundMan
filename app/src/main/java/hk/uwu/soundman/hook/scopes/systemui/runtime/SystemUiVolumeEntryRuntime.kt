@@ -32,6 +32,7 @@ import hk.uwu.soundman.hook.scopes.systemui.hidden.OfficialComponentMaterial
 import hk.uwu.soundman.hook.scopes.systemui.hidden.OfficialRingerBlur
 import hk.uwu.soundman.hook.scopes.systemui.hidden.OfficialRingerClone
 import hk.uwu.soundman.model.EntryMaterial
+import hk.uwu.soundman.model.EntryPosition
 import hk.uwu.soundman.overlay.OverlayOpenRequest
 import java.lang.ref.WeakReference
 import java.util.WeakHashMap
@@ -49,6 +50,13 @@ class SystemUiVolumeEntryRuntime(
     private val liquidGlassRefractionEnabled: () -> Boolean = { false },
     private val liquidGlassBlurRadius: () -> Int = { 20 },
     private val liquidGlassBlendColor: () -> Int = { 0x20FFFFFF },
+    /**
+     * 入口圆钮相对音量条的落位。
+     *
+     * 每次插入都会重新读：用户在 SoundMan 里改位置后，下一次音量面板回调
+     * （`onAttachedToWindow` / `updateExpandedH` …）就会把既有入口迁到新的落位。
+     */
+    private val entryPosition: () -> EntryPosition = { EntryPosition.DEFAULT },
     /**
      * 入口圆钮的材质来源。
      *
@@ -147,6 +155,7 @@ class SystemUiVolumeEntryRuntime(
         return try {
             removeCenteringFollow(entry)
             removeDragFollow(entry)
+            forgetPlacement(entry)
             (entry.parent as? ViewGroup)?.removeView(entry)
             entry.setOnClickListener(null)
             clearVisuals(entry)
@@ -211,6 +220,19 @@ class SystemUiVolumeEntryRuntime(
 
     private fun attachHyperLightGlass(chrome: View, radiusPx: Int): Boolean =
         hyperLightGlass.attach(chrome, radiusPx.toFloat())
+
+    /**
+     * 读取用户选择的入口落位；读取失败时保持默认落位。
+     *
+     * 位置偏好再怎么脏也只是「按钮摆在上还是在下」，不值得为此丢掉整颗入口，
+     * 所以这里一律吞异常回退默认，和材质/玻璃开关同一个处理口径。
+     */
+    private fun readEntryPosition(): EntryPosition = try {
+        entryPosition()
+    } catch (throwable: Throwable) {
+        log(Log.ERROR, TAG, "Unable to read volume entry position; keeping default", throwable)
+        EntryPosition.DEFAULT
+    }
 
     /**
      * 入口圆钮液态玻璃的渲染配置。
@@ -493,6 +515,7 @@ class SystemUiVolumeEntryRuntime(
                 return@Runnable
             }
             if (!beginInsertion()) return@Runnable
+            val position = readEntryPosition()
             try {
                 if (!closing.get() && !pending.cancelled.get()) {
                     insertEntry(
@@ -511,6 +534,7 @@ class SystemUiVolumeEntryRuntime(
                         ::attachEntryLiquidGlass,
                         ::attachHyperLightGlass,
                         pluginClassLoader,
+                        position,
                     )
                 }
             } catch (throwable: Throwable) {
@@ -969,9 +993,10 @@ class SystemUiVolumeEntryRuntime(
                 }
                 return
             }
-            val entryMargin =
-                (entry.layoutParams as? ViewGroup.MarginLayoutParams)?.bottomMargin ?: 0
-            val extra = entry.measuredHeight + entryMargin
+            // 入口两侧的 margin 也算进额外高度：官方 gap 可能落在上边（下方落位）也可能落在下边（上方落位）。
+            val entryMargins = (entry.layoutParams as? ViewGroup.MarginLayoutParams)
+                ?.let { it.topMargin + it.bottomMargin } ?: 0
+            val extra = entry.measuredHeight + entryMargins
             val compensated = base - extra / 2
             follow.lastBase = base
             if (current != compensated) {
@@ -1067,6 +1092,7 @@ class SystemUiVolumeEntryRuntime(
             attachLiquidGlass: (View, Int) -> Boolean,
             attachHyperLightGlass: (View, Int) -> Boolean,
             pluginClassLoader: ClassLoader?,
+            position: EntryPosition,
         ) {
             if (isClosing()) return
             if (!anchor.isLaidOut || anchor.measuredWidth <= 0 || anchor.measuredHeight <= 0) {
@@ -1097,8 +1123,25 @@ class SystemUiVolumeEntryRuntime(
                 log,
             )
             val metrics = resolveButtonMetrics(template, ::dp, dimenWidth, dimenHeight)
-            val gap = resolveOfficialGap(root, anchor, dp(SystemUiVolumeEntryLayout.MARGIN_VERTICAL_DP))
-            val placement = resolvePlacement(root, anchor, metrics, gap, log) ?: return
+            val hadEntry = findExistingEntry(root) != null
+            // 用户在面板还活着的时候改了落位：先把旧入口摘下来，
+            // 之后 indexOfChild(anchor) 才是干净的新落位下标。
+            detachMovedEntry(root, position, cleanup, log)
+            // 间距必须在「入口尚未插入」时才实测：入口一插进去，静音/免打扰与音量条
+            // 的实测距离就含入口自身，采信就会一次比一次大。注意 `removeView` 之后
+            // 兄弟视图的 top/bottom 仍是旧值，所以这里按「本轮开始时是否插过」判断。
+            val fallbackGapPx = dp(SystemUiVolumeEntryLayout.MARGIN_VERTICAL_DP)
+            val gapResolution = resolveOfficialGap(
+                ringerRoot = root,
+                volumeAnchor = anchor,
+                fallbackPx = fallbackGapPx,
+                entryPresent = hadEntry,
+                collapsed = !isExpanded(template.timerLayout),
+                // 间距再大也不会超过一整行的高度；用入口自身高度当上限，跟着 dpi 缩放。
+                maxPx = maxOf(fallbackGapPx, metrics.height),
+            )
+            val gap = gapResolution.px
+            val placement = resolvePlacement(root, anchor, metrics, gap, position, log) ?: return
             val dialogBound = resolveDialogBound(root)
             if (!isWithinBound(placement.parent, dialogBound)) {
                 failVisible(
@@ -1160,13 +1203,21 @@ class SystemUiVolumeEntryRuntime(
                 installDragFollow(entry, root, pluginClassLoader, log)
                 installCenteringFollow(entry, root, log)
                 entry.tag = ENTRY_TAG
+                appliedPositions[entry] = position
                 val action = if (existing === entry) "adopted" else "inserted"
+                val margins = placement.layoutParams as? ViewGroup.MarginLayoutParams
+                // 几何诊断：这些数字跨呼出周期必须稳定。若 anchorBounds / parentSize 逐次变大，
+                // 说明入口自身把容器撑大了，新一轮又按撑大后的锚点定位 —— 即漂移仍在。
                 log(
                     Log.INFO,
                     TAG,
                     "[systemui] $trigger $action SoundMan entry view=${describeInserted(entry)} " +
-                        "anchor=$anchorName parent=${placement.parent.javaClass.name} index=$insertIndex " +
-                        "size=${placement.layoutParams.width}x${placement.layoutParams.height}",
+                        "anchor=$anchorName position=$position parent=${placement.parent.javaClass.name} " +
+                        "index=$insertIndex gap=$gap/${gapResolution.source} " +
+                        "size=${placement.layoutParams.width}x${placement.layoutParams.height} " +
+                        "anchorBounds=[${anchor.top}..${anchor.bottom}] " +
+                        "parentSize=${placement.parent.width}x${placement.parent.height} " +
+                        "entryMargin=(top=${margins?.topMargin},bottom=${margins?.bottomMargin})",
                     null,
                 )
             } catch (throwable: Throwable) {
@@ -1182,6 +1233,54 @@ class SystemUiVolumeEntryRuntime(
 
         private fun describeInserted(view: View): String =
             "${view.javaClass.name}@${Integer.toHexString(System.identityHashCode(view))}"
+
+        /**
+         * 落位开关被改动后，把已经插好的入口从原来的父容器里摘下来。
+         *
+         * 动机：跨进程偏好是「写入即生效」的，但入口已经插在视图树里了，
+         * 光改 margin / 顺序不足以把它从音量条上方挪到下方——尤其是 FrameLayout 那种
+         * 绝对定位分支，必须重新算 topMargin。最省事也最稳的做法是整颗摘掉，
+         * 让后面的 [resolvePlacement] 按新落位重新插一遍。
+         *
+         * 只在「确实插过」且「落位真的变了」时动手，其余情况保持原样，
+         * 避免每次 `updateExpandedH` 都无意义地把入口来回挪。
+         */
+        private fun detachMovedEntry(
+            root: View,
+            position: EntryPosition,
+            cleanup: (View) -> Boolean,
+            log: (priority: Int, tag: String, message: String, throwable: Throwable?) -> Unit,
+        ) {
+            val existing = findExistingEntry(root) ?: return
+            val applied = appliedPositions[existing] ?: return
+            if (applied == position) return
+            log(
+                Log.INFO,
+                TAG,
+                "Moving SoundMan volume entry from $applied to $position",
+                null,
+            )
+            cleanup(existing)
+        }
+
+        /**
+         * 记住每颗已插入入口当时用的落位。
+         *
+         * 用 WeakHashMap：入口被官方视图树回收时不应该被这里吊住。
+         */
+        private val appliedPositions = WeakHashMap<View, EntryPosition>()
+
+        /**
+         * 每个 `MiuiRingerModeLayout` 上缓存的官方间距。
+         *
+         * 只存「入口尚未插入」时测到的值（见 [EntryPlacementPolicy.resolveGap]），
+         * 入口存在期间一律复用，避免把入口自身的高度反复算进官方间距里。
+         */
+        private val measuredGaps = WeakHashMap<View, Int>()
+
+        private fun forgetPlacement(entry: View) {
+            appliedPositions.remove(entry)
+        }
 
         private fun configureEntry(
             entry: FrameLayout,
@@ -1634,6 +1733,14 @@ class SystemUiVolumeEntryRuntime(
             return null
         }
 
+        /**
+         * 面板是否展开：DND 的 timer 行可见即展开。
+         *
+         * 与 [applyInsertVisibility] 共用同一判定，避免两处对「展开」的理解漂移。
+         */
+        private fun isExpanded(timerLayout: View?): Boolean =
+            timerLayout != null && timerLayout.isVisible
+
         private fun applyInsertVisibility(
             entry: View,
             timerLayout: View?,
@@ -1695,6 +1802,7 @@ class SystemUiVolumeEntryRuntime(
             anchor: View,
             metrics: CopiedMetrics,
             gap: Int,
+            position: EntryPosition,
             log: (priority: Int, tag: String, message: String, throwable: Throwable?) -> Unit,
         ): EntryPlacement? {
             val parent = anchor.parent as? ViewGroup
@@ -1713,7 +1821,7 @@ class SystemUiVolumeEntryRuntime(
             val entryWidth = alignEntryWidth(anchor)
             return when (parent) {
                 is LinearLayout -> when (parent.orientation) {
-                    LinearLayout.VERTICAL -> verticalPlacement(parent, anchor, metrics, entryWidth, gap)
+                    LinearLayout.VERTICAL -> verticalPlacement(parent, anchor, metrics, entryWidth, gap, position)
                     LinearLayout.HORIZONTAL -> outerVerticalPlacement(
                         root,
                         parent,
@@ -1721,12 +1829,13 @@ class SystemUiVolumeEntryRuntime(
                         metrics,
                         entryWidth,
                         gap,
+                        position,
                         log,
                         "horizontal LinearLayout",
                     )
                     else -> failVisible(parent, log, "LinearLayout has unsupported orientation")
                 }
-                is FrameLayout -> framePlacement(parent, anchor, metrics, entryWidth, gap)
+                is FrameLayout -> framePlacement(parent, anchor, metrics, entryWidth, gap, position)
                     ?: outerVerticalPlacement(
                         root,
                         parent,
@@ -1734,26 +1843,32 @@ class SystemUiVolumeEntryRuntime(
                         metrics,
                         entryWidth,
                         gap,
+                        position,
                         log,
-                        "FrameLayout cannot place entry above volume column",
+                        "FrameLayout cannot place entry $position volume column",
                     )
+                    ?: clampedFramePlacement(parent, metrics, entryWidth, gap)
                 else -> failVisible(parent, log, "unsupported volume column parent")
             }
         }
 
         private fun verticalPlacement(
             parent: LinearLayout,
-            insertBefore: View,
+            insertBeside: View,
             metrics: CopiedMetrics,
             entryWidth: Int,
             gap: Int,
+            position: EntryPosition,
         ): EntryPlacement {
+            val margins = EntryPlacementPolicy.verticalMargins(gap, position)
             val params = LinearLayout.LayoutParams(entryWidth, metrics.height).apply {
                 weight = 0f
-                gravity = volumeRowGravity(insertBefore)
-                setMargins(0, 0, 0, gap)
+                gravity = volumeRowGravity(insertBeside)
+                setMargins(0, margins.top, 0, margins.bottom)
             }
-            return EntryPlacement(parent, parent.indexOfChild(insertBefore), params)
+            val anchorIndex = parent.indexOfChild(insertBeside)
+            val index = EntryPlacementPolicy.insertIndex(anchorIndex, position)
+            return EntryPlacement(parent, index, params)
         }
 
         private fun outerVerticalPlacement(
@@ -1763,6 +1878,7 @@ class SystemUiVolumeEntryRuntime(
             metrics: CopiedMetrics,
             entryWidth: Int,
             gap: Int,
+            position: EntryPosition,
             log: (priority: Int, tag: String, message: String, throwable: Throwable?) -> Unit,
             reason: String,
         ): EntryPlacement? {
@@ -1771,7 +1887,14 @@ class SystemUiVolumeEntryRuntime(
             var ancestor = originalParent.parent
             while (ancestor is ViewGroup && isWithinBound(ancestor, dialogBound)) {
                 if (ancestor is LinearLayout && ancestor.orientation == LinearLayout.VERTICAL) {
-                    return verticalPlacement(ancestor, row, metrics, alignEntryWidth(row), gap)
+                    return verticalPlacement(
+                        ancestor,
+                        row,
+                        metrics,
+                        alignEntryWidth(row),
+                        gap,
+                        position,
+                    )
                 }
                 if (ancestor === dialogBound) break
                 row = ancestor
@@ -1852,24 +1975,59 @@ class SystemUiVolumeEntryRuntime(
             )
         }
 
-        private fun resolveOfficialGap(ringerRoot: View, volumeAnchor: View, fallbackPx: Int): Int {
-            val ringerMargin = (ringerRoot.layoutParams as? ViewGroup.MarginLayoutParams)?.topMargin ?: 0
-            if (ringerMargin > 0) return ringerMargin
-            val volumeMargin = (volumeAnchor.layoutParams as? ViewGroup.MarginLayoutParams)?.bottomMargin ?: 0
-            if (volumeMargin > 0) return volumeMargin
-            if (ringerRoot.isLaidOut && volumeAnchor.isLaidOut) {
-                if (ringerRoot.parent === volumeAnchor.parent) {
-                    return kotlin.math.abs(ringerRoot.top - volumeAnchor.bottom)
-                }
-                if (ringerRoot.isAttachedToWindow && volumeAnchor.isAttachedToWindow) {
-                    val ringerLoc = IntArray(2)
-                    val volumeLoc = IntArray(2)
-                    ringerRoot.getLocationOnScreen(ringerLoc)
-                    volumeAnchor.getLocationOnScreen(volumeLoc)
-                    return kotlin.math.abs(ringerLoc[1] - (volumeLoc[1] + volumeAnchor.height))
-                }
+        /**
+         * 官方「音量条 ↔ 静音/免打扰」之间的间距。
+         *
+         * ⚠️ 实测值**只能在入口还没插进去时采信**：入口一旦插入就会把这一对视图撑开，
+         * 再实测得到的是「入口高度 + 上一轮间距」，会被下一轮继续放大 ——
+         * 表现就是每呼出一次音量条，入口连带静音/免打扰按钮离音量条主体远一截。
+         * 取值顺序与缓存策略见 [EntryPlacementPolicy.resolveGap]。
+         *
+         * @param entryPresent 入口此刻是否已插在视图树里
+         * @param collapsed 面板是否折叠；展开态量出来的间距不适用于折叠态
+         * @param maxPx 实测值的合理上限
+         */
+        private fun resolveOfficialGap(
+            ringerRoot: View,
+            volumeAnchor: View,
+            fallbackPx: Int,
+            entryPresent: Boolean,
+            collapsed: Boolean,
+            maxPx: Int,
+        ): OfficialGapResolution {
+            val ringerMargin =
+                (ringerRoot.layoutParams as? ViewGroup.MarginLayoutParams)?.topMargin ?: 0
+            val volumeMargin =
+                (volumeAnchor.layoutParams as? ViewGroup.MarginLayoutParams)?.bottomMargin ?: 0
+            val resolution = EntryPlacementPolicy.resolveGap(
+                officialMargin = if (ringerMargin > 0) ringerMargin else volumeMargin,
+                cached = measuredGaps[ringerRoot],
+                measured = measureGap(ringerRoot, volumeAnchor),
+                entryPresent = entryPresent,
+                collapsed = collapsed,
+                fallback = fallbackPx,
+                maxPx = maxPx,
+            )
+            if (resolution.cacheable) {
+                measuredGaps[ringerRoot] = resolution.px
             }
-            return fallbackPx
+            return resolution
+        }
+
+        /** 实测静音/免打扰与音量条之间的距离；布局未完成时返回 null。 */
+        private fun measureGap(ringerRoot: View, volumeAnchor: View): Int? {
+            if (!ringerRoot.isLaidOut || !volumeAnchor.isLaidOut) return null
+            if (ringerRoot.parent === volumeAnchor.parent) {
+                return kotlin.math.abs(ringerRoot.top - volumeAnchor.bottom)
+            }
+            if (ringerRoot.isAttachedToWindow && volumeAnchor.isAttachedToWindow) {
+                val ringerLoc = IntArray(2)
+                val volumeLoc = IntArray(2)
+                ringerRoot.getLocationOnScreen(ringerLoc)
+                volumeAnchor.getLocationOnScreen(volumeLoc)
+                return kotlin.math.abs(ringerLoc[1] - (volumeLoc[1] + volumeAnchor.height))
+            }
+            return null
         }
 
         private fun alignEntryWidth(volumeAnchor: View): Int {
@@ -1899,14 +2057,51 @@ class SystemUiVolumeEntryRuntime(
             metrics: CopiedMetrics,
             entryWidth: Int,
             gap: Int,
+            position: EntryPosition,
         ): EntryPlacement? {
-            val topMargin = anchor.top - gap - metrics.height
+            val topMargin = EntryPlacementPolicy.frameTopMargin(
+                anchorTop = anchor.top,
+                anchorBottom = anchor.bottom,
+                entryHeight = metrics.height,
+                gap = gap,
+                position = position,
+            )
             if (topMargin < 0) return null
+            // 放不下就别硬放：绝对定位一旦超出父容器，wrap_content 父容器会被撑高，
+            // 而 MATCH_PARENT 的锚点会跟着变高，下一轮按 anchor.bottom 定位又会更往下
+            // （实测每轮 +（入口高+间距））。交给 outerVerticalPlacement 插成一整行。
+            if (!EntryPlacementPolicy.fitsInsideParent(topMargin, metrics.height, parent.height)) {
+                return null
+            }
             val params = FrameLayout.LayoutParams(entryWidth, metrics.height).apply {
                 gravity = Gravity.CENTER_HORIZONTAL
                 this.topMargin = topMargin
             }
             return EntryPlacement(parent, parent.indexOfChild(anchor), params)
+        }
+
+        /**
+         * 兜底落位：既放不进父容器、又找不到外层纵向容器时，贴着父容器底部放。
+         *
+         * 宁可和官方按钮重叠，也绝不能把父容器撑高（那会逐轮累加），更不能干脆不插。
+         *
+         * @param parent 音量条锚点的直接父容器
+         * @param metrics 入口尺寸
+         * @param entryWidth 入口宽度
+         * @param gap 官方间距，用作离底边的留白
+         */
+        private fun clampedFramePlacement(
+            parent: FrameLayout,
+            metrics: CopiedMetrics,
+            entryWidth: Int,
+            gap: Int,
+        ): EntryPlacement {
+            val topMargin = (parent.height - metrics.height - gap).coerceAtLeast(0)
+            val params = FrameLayout.LayoutParams(entryWidth, metrics.height).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+                this.topMargin = topMargin
+            }
+            return EntryPlacement(parent, parent.childCount, params)
         }
 
         private fun failVisible(

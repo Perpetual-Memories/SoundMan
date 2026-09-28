@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 import com.highcapable.yukihookapi.hook.factory.prefs
 import hk.uwu.soundman.log.AppLog
 import hk.uwu.soundman.model.EntryMaterial
+import hk.uwu.soundman.model.EntryPosition
 import hk.uwu.soundman.model.PanelMaterial
 
 internal const val APP_SETTINGS_PREFERENCES_NAME = "soundman_app_settings"
@@ -21,6 +22,15 @@ data class AppSettings(
     val liquidGlassRefractionEnabled: Boolean = AppSettingsDefaults.LIQUID_GLASS_REFRACTION_ENABLED,
     val liquidGlassBlurRadius: Int = AppSettingsDefaults.LIQUID_GLASS_BLUR_RADIUS,
     val liquidGlassBlendColor: Int = AppSettingsDefaults.LIQUID_GLASS_BLEND_COLOR,
+
+    /**
+     * 入口圆钮相对音量条的落位。
+     *
+     * 只在侧栏入口生效（与 [systemUiBuiltinVolumePanelEnabled] 无关）；
+     * 入口插入时每次重新读，切换后下一次面板回调就会把按钮挪过去。
+     */
+    val entryPosition: EntryPosition = AppSettingsDefaults.ENTRY_POSITION,
+
     /**
      * 入口圆钮的材质来源：跟随 HyperLight / 自研玻璃 / 官方高光材质。
      *
@@ -67,6 +77,9 @@ object AppSettingsDefaults {
     const val LIQUID_GLASS_BLUR_RADIUS_MIN = 0
     const val LIQUID_GLASS_BLUR_RADIUS_MAX = 20
     const val LIQUID_GLASS_BLEND_COLOR = 0x20FFFFFF
+
+    /** 入口圆钮默认落在音量条上方，保持模块原本的行为。 */
+    val ENTRY_POSITION: EntryPosition = EntryPosition.ABOVE
     /** 入口材质默认跟随 HyperLight，拿不到时自动退回自研玻璃。 */
     val ENTRY_MATERIAL: EntryMaterial = EntryMaterial.DEFAULT
 
@@ -86,6 +99,14 @@ object AppSettingsKeys {
     const val LIQUID_GLASS_BLUR_RADIUS = "liquid_glass_blur_radius"
     const val LIQUID_GLASS_BLEND_COLOR = "liquid_glass_blend_color"
 
+    /**
+     * 入口圆钮落位的键名。
+     *
+     * 值取自 [EntryPosition.storedValue]，故意不用布尔：以后若再加档位，
+     * 老用户的「上方」不会被新的布尔语义带偏。
+     */
+    const val ENTRY_POSITION = "entry_position"
+
     /** 入口圆钮材质来源的键名，值取自 [EntryMaterial.storedValue]。 */
     const val ENTRY_MATERIAL = "entry_material"
 
@@ -102,6 +123,7 @@ object AppSettingsKeys {
         LIQUID_GLASS_REFRACTION,
         LIQUID_GLASS_BLUR_RADIUS,
         LIQUID_GLASS_BLEND_COLOR,
+        ENTRY_POSITION,
         ENTRY_MATERIAL,
         HYPER_LIGHT_PANEL_GLASS,
     )
@@ -142,6 +164,10 @@ interface AppSettingsStore {
 
     /** 持久化液态玻璃混色颜色（ARGB），并返回最新快照。 */
     fun setLiquidGlassBlendColor(color: Int): AppSettings
+
+    /** 持久化入口圆钮相对音量条的落位，并返回最新快照。 */
+    fun setEntryPosition(position: EntryPosition): AppSettings
+
     /** 持久化入口圆钮的材质来源，并返回最新快照。 */
     fun setEntryMaterial(material: EntryMaterial): AppSettings
 
@@ -260,6 +286,19 @@ object SystemUiAppSettingsSync {
                     "available=${crossProcessPreferences.isPreferencesAvailable}",
         )
     }
+
+    /** 将"入口圆钮位置"同步到跨进程偏好，供 SystemUI 入口下次插入时读取。 */
+    fun persistEntryPosition(context: Context, position: EntryPosition) {
+        val crossProcessPreferences = context.prefs(SYSTEM_UI_SETTINGS_PREFERENCES_NAME)
+        crossProcessPreferences.edit {
+            putString(AppSettingsKeys.ENTRY_POSITION, position.storedValue)
+        }
+        AppLog.info(
+            "Persisted entry position setting position=$position " +
+                    "available=${crossProcessPreferences.isPreferencesAvailable}",
+        )
+    }
+
     /** 将"入口材质来源"同步到跨进程偏好，供 SystemUI 入口下次插入时读取。 */
     fun persistEntryMaterial(context: Context, material: EntryMaterial) {
         val crossProcessPreferences = context.prefs(SYSTEM_UI_SETTINGS_PREFERENCES_NAME)
@@ -296,6 +335,7 @@ class SharedPreferencesAppSettingsStore(
     private val liquidGlassRefractionMirror: ((Boolean) -> Unit)? = null,
     private val liquidGlassBlurRadiusMirror: ((Int) -> Unit)? = null,
     private val liquidGlassBlendColorMirror: ((Int) -> Unit)? = null,
+    private val entryPositionMirror: ((EntryPosition) -> Unit)? = null,
     private val entryMaterialMirror: ((EntryMaterial) -> Unit)? = null,
     private val hyperLightPanelGlassMirror: ((Boolean) -> Unit)? = null,
 ) : AppSettingsStore {
@@ -336,6 +376,9 @@ class SharedPreferencesAppSettingsStore(
             liquidGlassBlendColor = preferences.getInt(
                 AppSettingsKeys.LIQUID_GLASS_BLEND_COLOR,
                 AppSettingsDefaults.LIQUID_GLASS_BLEND_COLOR,
+            ),
+            entryPosition = EntryPosition.fromStored(
+                preferences.getString(AppSettingsKeys.ENTRY_POSITION, null)
             ),
             entryMaterial = EntryMaterial.fromStored(
                 preferences.getString(AppSettingsKeys.ENTRY_MATERIAL, null)
@@ -485,6 +528,23 @@ class SharedPreferencesAppSettingsStore(
                 error.addSuppressed(rollbackError)
             }
             AppLog.error("Unable to mirror liquid glass blend color", error)
+            throw error
+        }
+        return updated
+    }
+
+    override fun setEntryPosition(position: EntryPosition): AppSettings {
+        val previous = read().entryPosition
+        val updated = writeString(AppSettingsKeys.ENTRY_POSITION, position.storedValue)
+        try {
+            entryPositionMirror?.invoke(position)
+        } catch (error: RuntimeException) {
+            try {
+                writeString(AppSettingsKeys.ENTRY_POSITION, previous.storedValue)
+            } catch (rollbackError: RuntimeException) {
+                error.addSuppressed(rollbackError)
+            }
+            AppLog.error("Unable to mirror entry position setting", error)
             throw error
         }
         return updated

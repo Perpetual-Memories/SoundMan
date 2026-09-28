@@ -95,6 +95,9 @@ class MainActivity : ComponentActivity() {
             liquidGlassBlendColorMirror = { color ->
                 SystemUiAppSettingsSync.persistLiquidGlassBlendColor(this, color)
             },
+            entryPositionMirror = { position ->
+                SystemUiAppSettingsSync.persistEntryPosition(this, position)
+            },
             entryMaterialMirror = { material ->
                 SystemUiAppSettingsSync.persistEntryMaterial(this, material)
             },
@@ -187,6 +190,17 @@ class MainActivity : ComponentActivity() {
         } catch (error: RuntimeException) {
             AppLog.error(
                 "Unable to synchronize liquid glass blend color during startup",
+                error
+            )
+        }
+        try {
+            SystemUiAppSettingsSync.persistEntryPosition(
+                this,
+                settingsStore.read().entryPosition,
+            )
+        } catch (error: RuntimeException) {
+            AppLog.error(
+                "Unable to synchronize volume entry position during startup",
                 error
             )
         }

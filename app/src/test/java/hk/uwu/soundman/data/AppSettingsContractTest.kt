@@ -1,5 +1,6 @@
 package hk.uwu.soundman.data
 
+import hk.uwu.soundman.model.EntryPosition
 import hk.uwu.soundman.model.PanelMaterial
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -53,6 +54,10 @@ class AppSettingsContractTest {
             settings.liquidGlassBlendColor,
         )
         assertEquals(0x20FFFFFF, AppSettingsDefaults.LIQUID_GLASS_BLEND_COLOR)
+        // 入口默认仍在音量条上方：新增档位不能改变既有用户的排布。
+        assertEquals(AppSettingsDefaults.ENTRY_POSITION, settings.entryPosition)
+        assertEquals(EntryPosition.DEFAULT, settings.entryPosition)
+        assertEquals(EntryPosition.ABOVE, settings.entryPosition)
         // 面板玻璃默认跟随 HyperLight：与系统展开面板同一条链路。
         assertEquals(
             AppSettingsDefaults.HYPER_LIGHT_PANEL_GLASS_ENABLED,
@@ -107,12 +112,13 @@ class AppSettingsContractTest {
                 "liquid_glass_refraction_enabled",
                 "liquid_glass_blur_radius",
                 "liquid_glass_blend_color",
+                "entry_position",
                 "entry_material",
                 "hyperlight_panel_glass_enabled",
             ),
             AppSettingsKeys.all,
         )
-        assertEquals(11, AppSettingsKeys.all.size)
+        assertEquals(12, AppSettingsKeys.all.size)
         assertNotEquals(AppSettingsKeys.SMOOTH_CORNERS, AppSettingsKeys.VOLUME_PERCENT)
         assertNotEquals(
             AppSettingsKeys.VOLUME_PERCENT,

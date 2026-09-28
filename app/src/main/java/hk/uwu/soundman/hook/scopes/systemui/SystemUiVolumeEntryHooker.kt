@@ -15,6 +15,7 @@ import hk.uwu.soundman.hook.scopes.systemui.hidden.SystemUiPluginClassLoaderAtta
 import hk.uwu.soundman.hook.scopes.systemui.hidden.SystemUiPluginHookTargets
 import hk.uwu.soundman.hook.scopes.systemui.runtime.SystemUiVolumeEntryRuntime
 import hk.uwu.soundman.model.EntryMaterial
+import hk.uwu.soundman.model.EntryPosition
 import java.lang.invoke.MethodHandles
 
 /**
@@ -35,6 +36,7 @@ object SystemUiVolumeEntryHooker : YukiBaseHooker() {
         liquidGlassRefractionEnabled = ::isLiquidGlassRefractionEnabled,
         liquidGlassBlurRadius = ::liquidGlassBlurRadius,
         liquidGlassBlendColor = ::liquidGlassBlendColor,
+        entryPosition = ::entryPosition,
         entryMaterial = ::entryMaterial,
         hyperLightPanelGlassEnabled = ::isHyperLightPanelGlassEnabled,
     )
@@ -425,6 +427,19 @@ object SystemUiVolumeEntryHooker : YukiBaseHooker() {
     } catch (error: Throwable) {
         YLog.error("Unable to read liquid glass blend color through Yuki prefs", error)
         AppSettingsDefaults.LIQUID_GLASS_BLEND_COLOR
+    }
+
+    /**
+     * 入口圆钮落位跨进程读取：持久化值是字符串，非法值一律回退默认（音量条上方）。
+     *
+     * @return 用户选择的落位；读取失败时为 [EntryPosition.DEFAULT]
+     */
+    private fun entryPosition(): EntryPosition = try {
+        val modulePrefs = prefs(SYSTEM_UI_SETTINGS_PREFERENCES_NAME)
+        EntryPosition.fromStored(modulePrefs.all()[AppSettingsKeys.ENTRY_POSITION] as? String)
+    } catch (error: Throwable) {
+        YLog.error("Unable to read entry position setting through Yuki prefs", error)
+        EntryPosition.DEFAULT
     }
 
     /**
