@@ -1,5 +1,6 @@
 package hk.uwu.soundman.hook.scopes.systemui
 
+import android.graphics.drawable.Drawable
 import android.util.Log
 import android.view.View
 import com.highcapable.kavaref.KavaRef.Companion.resolve
@@ -13,6 +14,7 @@ import hk.uwu.soundman.hook.scopes.systemui.hidden.SystemUiPluginClassLoader
 import hk.uwu.soundman.hook.scopes.systemui.hidden.SystemUiPluginClassLoaderAttach
 import hk.uwu.soundman.hook.scopes.systemui.hidden.SystemUiPluginHookTargets
 import hk.uwu.soundman.hook.scopes.systemui.runtime.SystemUiVolumeEntryRuntime
+import hk.uwu.soundman.model.EntryMaterial
 import java.lang.invoke.MethodHandles
 
 /**
@@ -33,12 +35,43 @@ object SystemUiVolumeEntryHooker : YukiBaseHooker() {
         liquidGlassRefractionEnabled = ::isLiquidGlassRefractionEnabled,
         liquidGlassBlurRadius = ::liquidGlassBlurRadius,
         liquidGlassBlendColor = ::liquidGlassBlendColor,
+        entryMaterial = ::entryMaterial,
+        hyperLightPanelGlassEnabled = ::isHyperLightPanelGlassEnabled,
     )
     private val pluginClassLoaderReader = SystemUiPluginClassLoader()
     private val pluginClassLoaderAttach = SystemUiPluginClassLoaderAttach()
 
     override fun onHook() {
         PLUGIN_WATCH_TARGETS.forEach(::watchPluginTarget)
+        installHyperLightBackgroundWatch()
+    }
+
+    /**
+     * 监听 `View.setBackground` 以捕获 HyperLight 挂上的玻璃 Drawable。
+     *
+     * 这是拿到它那一份热 ClassLoader 的唯一途径：模块的类只活在 LSPosed 的
+     * `LspModuleClassLoader` 里，没有枚举入口，只能等它自己往 View 上挂东西时反查。
+     * 回调里只做一次字符串包含判断，开销可忽略。
+     */
+    private fun installHyperLightBackgroundWatch() {
+        val resolved = runCatching { View::class.java.resolve().optional() }
+            .onFailure { YLog.warn("Background watch resolve failed", it) }
+            .getOrNull() ?: return
+        val methods = safeResolve(
+            block = { resolved.method { name = METHOD_SET_BACKGROUND } },
+            onFailure = { error -> YLog.warn("Background watch method missing", error) },
+        )
+        methods.forEach { method ->
+            method.hook {
+                after {
+                    runCatching {
+                        val drawable = args.getOrNull(0) as? Drawable ?: return@runCatching
+                        runtime.noteBackground(drawable)
+                    }
+                }
+            }
+            YLog.info("Installed background watch: ${method.self.toGenericString()}")
+        }
     }
 
     private fun watchPluginTarget(target: SystemUiVolumeEntryHookTarget) {
@@ -394,6 +427,39 @@ object SystemUiVolumeEntryHooker : YukiBaseHooker() {
         AppSettingsDefaults.LIQUID_GLASS_BLEND_COLOR
     }
 
+    /**
+     * 「面板跟随 HyperLight 玻璃」开关跨进程读取：默认开启，读取失败时按默认处理。
+     *
+     * 关掉后面板不再调用 HyperLight 的挂载入口，只保留官方展开材质 + 自研玻璃。
+     */
+    private fun isHyperLightPanelGlassEnabled(): Boolean = try {
+        val modulePrefs = prefs(SYSTEM_UI_SETTINGS_PREFERENCES_NAME)
+        val value = modulePrefs.all()[AppSettingsKeys.HYPER_LIGHT_PANEL_GLASS]
+        when (value) {
+            null -> AppSettingsDefaults.HYPER_LIGHT_PANEL_GLASS_ENABLED
+            is Boolean -> value
+            else -> error(
+                "Invalid ${AppSettingsKeys.HYPER_LIGHT_PANEL_GLASS} type=${value.javaClass.name}",
+            )
+        }
+    } catch (error: Throwable) {
+        YLog.error("Unable to read HyperLight panel glass setting through Yuki prefs", error)
+        AppSettingsDefaults.HYPER_LIGHT_PANEL_GLASS_ENABLED
+    }
+
+    /**
+     * 入口圆钮材质来源跨进程读取：持久化值是字符串，非法值一律回退默认。
+     *
+     * @return 用户选择的材质；读取失败时为 [EntryMaterial.DEFAULT]
+     */
+    private fun entryMaterial(): EntryMaterial = try {
+        val modulePrefs = prefs(SYSTEM_UI_SETTINGS_PREFERENCES_NAME)
+        EntryMaterial.fromStored(modulePrefs.all()[AppSettingsKeys.ENTRY_MATERIAL] as? String)
+    } catch (error: Throwable) {
+        YLog.error("Unable to read entry material setting through Yuki prefs", error)
+        EntryMaterial.DEFAULT
+    }
+
     private fun writeLog(priority: Int, tag: String, message: String, throwable: Throwable?) {
         val text = "[$tag] $message"
         when (priority) {
@@ -442,6 +508,7 @@ object SystemUiVolumeEntryHooker : YukiBaseHooker() {
     private const val METHOD_FINISH_INFLATE = "onFinishInflate"
     private const val METHOD_ATTACHED_TO_WINDOW = "onAttachedToWindow"
     private const val METHOD_UPDATE_EXPANDED_H = "updateExpandedH"
+    private const val METHOD_SET_BACKGROUND = "setBackground"
     private const val METHOD_SHOW_H = "showH"
     private const val METHOD_DISMISS_H = "dismissH"
     private const val OFFICIAL_DISMISS_REASON = 8

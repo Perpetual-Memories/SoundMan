@@ -8,6 +8,7 @@ import android.content.Intent
 import android.content.res.Configuration
 import android.graphics.Outline
 import android.graphics.drawable.Drawable
+import android.graphics.drawable.LayerDrawable
 import android.os.Handler
 import android.os.Looper
 import android.util.DisplayMetrics
@@ -26,7 +27,11 @@ import androidx.core.view.isVisible
 import com.highcapable.kavaref.KavaRef.Companion.resolve
 import com.highcapable.kavaref.extension.toClassOrNull
 import hk.uwu.soundman.R
+import hk.uwu.soundman.hook.scopes.systemui.hidden.HyperLightGlassBridge
+import hk.uwu.soundman.hook.scopes.systemui.hidden.OfficialComponentMaterial
 import hk.uwu.soundman.hook.scopes.systemui.hidden.OfficialRingerBlur
+import hk.uwu.soundman.hook.scopes.systemui.hidden.OfficialRingerClone
+import hk.uwu.soundman.model.EntryMaterial
 import hk.uwu.soundman.overlay.OverlayOpenRequest
 import java.lang.ref.WeakReference
 import java.util.WeakHashMap
@@ -44,8 +49,22 @@ class SystemUiVolumeEntryRuntime(
     private val liquidGlassRefractionEnabled: () -> Boolean = { false },
     private val liquidGlassBlurRadius: () -> Int = { 20 },
     private val liquidGlassBlendColor: () -> Int = { 0x20FFFFFF },
+    /**
+     * 入口圆钮的材质来源。
+     *
+     * 默认 [EntryMaterial.HYPERLIGHT]：拿得到 HyperLight 就用它的液态玻璃，
+     * 拿不到自动退回自研玻璃（再退官方高光材质），不会让入口变成裸按钮。
+     */
+    private val entryMaterial: () -> EntryMaterial = { EntryMaterial.DEFAULT },
+    /**
+     * 内置面板是否跟随 HyperLight 的液态玻璃（系统展开面板同款）。
+     *
+     * 关掉后面板只走官方展开材质 + SoundMan 自研玻璃，与没有 HyperLight 时一致。
+     */
+    private val hyperLightPanelGlassEnabled: () -> Boolean = { true },
 ) {
     private val officialDismissHook = SystemUiOfficialDismissHookBridge(log)
+    private val hyperLightGlass = HyperLightGlassBridge(log)
     private val builtinPanel = SystemUiBuiltinVolumePanel(
         log = log,
         hookDismiss = officialDismissHook::dismiss,
@@ -56,6 +75,12 @@ class SystemUiVolumeEntryRuntime(
         liquidGlassRefractionEnabled = liquidGlassRefractionEnabled,
         liquidGlassBlurRadius = liquidGlassBlurRadius,
         liquidGlassBlendColor = liquidGlassBlendColor,
+        hyperLightPanelGlass = { view, radius ->
+            hyperLightPanelGlassEnabled() &&
+                hyperLightGlass.available() &&
+                hyperLightGlass.liquidGlassEnabled() &&
+                hyperLightGlass.attachExpandedPanel(view, radius)
+        },
     )
     private val trackedEntries = ArrayList<TrackedEntry>()
     private val pendingInsertions = ArrayList<PendingInsertion>()
@@ -66,16 +91,19 @@ class SystemUiVolumeEntryRuntime(
     private val insertionsIdle = lifecycleLock.newCondition()
     private var activeInsertions = 0
     private var officialBlur: OfficialRingerBlur? = null
+    private var componentMaterial: OfficialComponentMaterial? = null
     private var pluginClassLoader: ClassLoader? = null
+    private val entryGlass = WeakHashMap<View, LiquidGlassPanelDrawable>()
 
     /**
      * 插件 ClassLoader 就绪后安装 live MiBlur 入口。
      *
-     * `MiBlurCompat` / `Util` 只在插件 ClassLoader 里。
+     * `MiBlurCompat` / `Util` / `miuix.*` 只在插件 ClassLoader 里。
      */
     fun attachPluginClassLoader(pluginClassLoader: ClassLoader) {
         this.pluginClassLoader = pluginClassLoader
         officialBlur = OfficialRingerBlur(pluginClassLoader, log)
+        componentMaterial = OfficialComponentMaterial(pluginClassLoader, log)
     }
 
     /** 缓存 hook 框架已捕获的官方 controller 及其公开 dismissH 入口。 */
@@ -135,6 +163,13 @@ class SystemUiVolumeEntryRuntime(
         view.background = null
         view.outlineProvider = null
         view.clipToOutline = false
+        entryGlass.remove(view)?.let { glass ->
+            try {
+                glass.release()
+            } catch (throwable: Throwable) {
+                log(Log.ERROR, TAG, "Unable to release entry liquid glass", throwable)
+            }
+        }
         if (view is ImageView) {
             view.setImageDrawable(null)
         }
@@ -142,6 +177,82 @@ class SystemUiVolumeEntryRuntime(
             for (index in 0 until view.childCount) {
                 clearVisuals(view.getChildAt(index))
             }
+        }
+    }
+
+    /**
+     * 入口圆钮材质档位：玻璃优先，其次官方组件材质，最后 ringer chrome。
+     *
+     * 放实例方法是因为设置开关（[liquidGlassEnabled]）只在实例上，而插入逻辑在
+     * companion 里。
+     *
+     * 入口有没有玻璃由「按钮材质」一档决定：[EntryMaterial.LIQUID] 就是要自研玻璃，
+     * [EntryMaterial.HYPERLIGHT] 拿不到 HyperLight 时也会退回自研玻璃，
+     * 不再单独给入口留一个玻璃开关——那与材质档位互相冲突。
+     */
+    private fun chooseEntryMaterial(context: Context): EntryMaterialMode =
+        EntryMaterialPolicy.choose(
+            componentMaterialAvailable = componentMaterial?.available(context) == true,
+            liquidGlassEnabled = liquidGlassEnabled(),
+            entryMaterial = entryMaterial(),
+            // 光抓到 ClassLoader 不算数，还得它自己的液态玻璃是开着的。
+            hyperLightReady = hyperLightGlass.available() && hyperLightGlass.liquidGlassEnabled(),
+        )
+
+    /**
+     * 把 `View.setBackground` 的调用转给 HyperLight 桥接层。
+     *
+     * 这是拿到它那一份热 ClassLoader 的唯一途径——模块的类只活在 LSPosed 的
+     * `LspModuleClassLoader` 里，没法直接枚举，只能等它自己挂载时反查。
+     */
+    fun noteBackground(drawable: Drawable) {
+        runCatching { hyperLightGlass.noteBackground(drawable) }
+    }
+
+    private fun attachHyperLightGlass(chrome: View, radiusPx: Int): Boolean =
+        hyperLightGlass.attach(chrome, radiusPx.toFloat())
+
+    /**
+     * 入口圆钮液态玻璃的渲染配置。
+     *
+     * 与内置展开面板共用同一组用户参数，官方组件材质不可用（或用户没装 HyperLight
+     * 那类模块）时，入口靠它和展开面板保持同款观感。
+     */
+    private fun entryLiquidGlassConfig(): LiquidGlassPanelConfig? {
+        if (!liquidGlassEnabled()) return null
+        return LiquidGlassPanelConfig(
+            enabled = true,
+            trueRefraction = LiquidGlassPanelPolicy.refractionActive(
+                liquidGlassEnabled(),
+                liquidGlassRefractionEnabled(),
+            ),
+            captureBlurRadius = liquidGlassBlurRadius().toFloat().coerceIn(0f, 20f),
+            blendColor = liquidGlassBlendColor(),
+        )
+    }
+
+    /**
+     * 把液态玻璃叠在入口现有材质之上，和内置面板一样用 LayerDrawable 叠加而不是覆盖。
+     *
+     * 折射层不透明时视觉上替换下方材质，捕获失败则整层不绘制、露出官方材质兜底。
+     */
+    private fun attachEntryLiquidGlass(chrome: View, radiusPx: Int): Boolean {
+        val config = entryLiquidGlassConfig() ?: return false
+        return try {
+            val glass = LiquidGlassPanelDrawable(
+                context = chrome.context,
+                host = chrome,
+                initialConfig = config,
+                initialCornerRadius = radiusPx.toFloat(),
+                log = log,
+            )
+            val official = chrome.background
+            chrome.background = if (official != null) LayerDrawable(arrayOf(official, glass)) else glass
+            entryGlass[chrome] = glass
+            true
+        } catch (throwable: Throwable) {
+            log(Log.ERROR, TAG, "Entry liquid glass attach failed; keeping official material only", throwable)
+            false
         }
     }
 
@@ -395,6 +506,10 @@ class SystemUiVolumeEntryRuntime(
                         ::cleanupEntryAndPanel,
                         ::openPanel,
                         officialBlur,
+                        componentMaterial,
+                        ::chooseEntryMaterial,
+                        ::attachEntryLiquidGlass,
+                        ::attachHyperLightGlass,
                         pluginClassLoader,
                     )
                 }
@@ -947,6 +1062,10 @@ class SystemUiVolumeEntryRuntime(
             cleanup: (View) -> Boolean,
             openOverlay: (Context, String, View) -> Unit,
             officialBlur: OfficialRingerBlur?,
+            componentMaterial: OfficialComponentMaterial?,
+            chooseMaterial: (Context) -> EntryMaterialMode,
+            attachLiquidGlass: (View, Int) -> Boolean,
+            attachHyperLightGlass: (View, Int) -> Boolean,
             pluginClassLoader: ClassLoader?,
         ) {
             if (isClosing()) return
@@ -1013,6 +1132,12 @@ class SystemUiVolumeEntryRuntime(
                         isClosing,
                         openOverlay,
                         officialBlur,
+                        componentMaterial,
+                        chooseMaterial,
+                        attachLiquidGlass,
+                        attachHyperLightGlass,
+                        pluginClassLoader,
+                        officialLayout = root,
                     )
                 ) {
                     return
@@ -1067,6 +1192,12 @@ class SystemUiVolumeEntryRuntime(
             isClosing: () -> Boolean,
             openOverlay: (Context, String, View) -> Unit,
             officialBlur: OfficialRingerBlur?,
+            componentMaterial: OfficialComponentMaterial?,
+            chooseMaterial: (Context) -> EntryMaterialMode,
+            attachLiquidGlass: (View, Int) -> Boolean,
+            attachHyperLightGlass: (View, Int) -> Boolean,
+            pluginClassLoader: ClassLoader?,
+            officialLayout: View?,
         ): Boolean {
             val iconDrawable = resolvePhoneIcon(targetContext, packages, log) ?: return false
             val radiusPx = resolveNamedDimenPx(
@@ -1109,6 +1240,66 @@ class SystemUiVolumeEntryRuntime(
             entry.contentDescription = contentDescription
             entry.tag = ENTRY_TAG
             val liveRadius = radiusPx ?: (fallbackWidth / 2)
+            val mode = chooseMaterial(targetContext)
+            // HYPERLIGHT 档优先走「官方按钮克隆」：inflate miui_ringer_mode_layout +
+            // 绑官方 RingerButtonHelper，让入口和铃铛/月亮走同一条官方材质链路。
+            // HyperLight 拦的就是这条链路 —— 克隆按钮会自动带上一整套玻璃效果
+            // （含描边/陀螺仪折射/触控辉光），这是手工调 zf0.l 拿不到的；
+            // HyperLight 没装时就是官方材质，观感仍然和铃铛月亮一致。
+            if (mode == EntryMaterialMode.HYPERLIGHT_GLASS) {
+                val openEntry = View.OnClickListener { clickedView ->
+                    if (isClosing()) return@OnClickListener
+                    openOverlay(clickedView.context, "click", clickedView)
+                }
+                val cloned = OfficialRingerClone.create(
+                    targetContext = targetContext,
+                    packages = packages,
+                    pluginClassLoader = pluginClassLoader,
+                    officialLayout = officialLayout,
+                    iconDrawable = iconDrawable,
+                    applyFallbackMaterial = { view ->
+                        runCatching {
+                            officialBlur?.applyCollapsedChrome(view, liveRadius)
+                        }.onFailure { throwable ->
+                            log(
+                                Log.INFO,
+                                TAG,
+                                "Official ringer clone fallback material failed",
+                                throwable,
+                            )
+                        }.getOrDefault(false) == true
+                    },
+                    onClick = openEntry,
+                    log = log,
+                )
+                if (cloned != null) {
+                    entry.removeAllViews()
+                    entry.addView(
+                        cloned,
+                        FrameLayout.LayoutParams(
+                            ViewGroup.LayoutParams.MATCH_PARENT,
+                            ViewGroup.LayoutParams.MATCH_PARENT,
+                        ),
+                    )
+                    // bg_blur 已经在 clone 里被覆盖成同一个监听器；这里再给 root/entry
+                    // 兜一层，保证事件无论落在哪一层都只会打开 SoundMan 面板。
+                    cloned.setOnClickListener(openEntry)
+                    entry.setOnClickListener(openEntry)
+                    log(
+                        Log.INFO,
+                        TAG,
+                        "SoundMan entry uses cloned official ringer button; HyperLight glass follows the official path",
+                        null,
+                    )
+                    return true
+                }
+                log(
+                    Log.INFO,
+                    TAG,
+                    "Official ringer clone unavailable; falling back to manual HyperLight glass",
+                    null,
+                )
+            }
             val blurLayer = officialBlur?.createCollapsedBlurLayer(targetContext, liveRadius)
                 ?: View(targetContext)
             blurLayer.id = View.NO_ID
@@ -1135,18 +1326,43 @@ class SystemUiVolumeEntryRuntime(
                 "volume entry button background",
             )
             val themeBlur = officialBlur?.themeBlurOpened(targetContext)
-            val liveApplied = themeBlur != false && officialBlur != null &&
-                officialBlur.applyCollapsedChrome(chrome, liveRadius)
-            if (themeBlur == true && !liveApplied) {
+            val componentApplied = mode == EntryMaterialMode.COMPONENT &&
+                runCatching {
+                    componentMaterial?.apply(
+                        chrome,
+                        liveRadius,
+                        EntryMaterialPolicy.isNight(targetContext.resources.configuration.uiMode),
+                    ) == true
+                }.onFailure { throwable ->
+                    log(
+                        Log.INFO,
+                        TAG,
+                        "Official component material unavailable; falling back to ringer chrome",
+                        throwable,
+                    )
+                }.getOrDefault(false)
+            val liveApplied = if (componentApplied) {
+                false
+            } else {
+                themeBlur != false && officialBlur != null &&
+                    officialBlur.applyCollapsedChrome(chrome, liveRadius)
+            }
+            if (!componentApplied && themeBlur == true && !liveApplied) {
                 log(Log.ERROR, TAG, "Theme live blur is on but official chrome blend failed; skip insertion", null)
                 return false
             }
-            val newMaterial = liveApplied && officialBlur.usedNewMaterialChrome() == true
+            // 官方组件材质自带完整背景，和 ringer 的「新系统 material」一样不要再叠静态 blur。
+            val newMaterial = componentApplied ||
+                (liveApplied && officialBlur?.usedNewMaterialChrome() == true)
             blurLayer.background = if (newMaterial) null else blurBackground
-            if (liveApplied) {
-                chrome.background = null
-                if (newMaterial) {
-                    log(Log.INFO, TAG, "Applied official volume-column material chrome", null)
+            // HyperLight 的渲染器拿 view 当前 background 当底图；铃铛/月亮是官方 View，
+            // 本来就带着官方按钮底，我们若跟着置 null，玻璃就只剩一层"悬空"的折射，
+            // 观感自然对不上。所以这一档要把官方按钮底留在下面。
+            val keepGlassBase = mode == EntryMaterialMode.HYPERLIGHT_GLASS
+            if (componentApplied || liveApplied) {
+                chrome.background = if (keepGlassBase) buttonBackground else null
+                if (componentApplied) {
+                    log(Log.INFO, TAG, "Applied volume-column component material to SoundMan entry", null)
                 } else {
                     log(
                         Log.INFO,
@@ -1161,6 +1377,28 @@ class SystemUiVolumeEntryRuntime(
                     return false
                 }
                 chrome.background = buttonBackground
+            }
+            // HyperLight 的渲染器会把 view 当前 background 当 base 叠在自己下面，
+            // 所以必须等上面把 chrome.background 定完再挂；挂不上就退回自研玻璃。
+            val hyperLightApplied = mode == EntryMaterialMode.HYPERLIGHT_GLASS &&
+                !componentApplied &&
+                attachHyperLightGlass(chrome, liveRadius)
+            if (hyperLightApplied) {
+                log(
+                    Log.INFO,
+                    TAG,
+                    "Applied HyperLight liquid glass to SoundMan entry (base=${chrome.background != null})",
+                    null,
+                )
+            } else if (mode == EntryMaterialMode.HYPERLIGHT_GLASS && !componentApplied) {
+                log(Log.INFO, TAG, "HyperLight glass unavailable; falling back to own glass", null)
+            }
+            // 自研玻璃只在 LIQUID 档叠；HYPERLIGHT 档挂不上时兜底。
+            // RINGER / COMPONENT 档不叠，保持模块原本的观感。
+            val wantOwnGlass = mode == EntryMaterialMode.LIQUID_GLASS ||
+                (mode == EntryMaterialMode.HYPERLIGHT_GLASS && !hyperLightApplied)
+            if (!componentApplied && wantOwnGlass && attachLiquidGlass(chrome, liveRadius)) {
+                log(Log.INFO, TAG, "Applied builtin-panel liquid glass to SoundMan entry", null)
             }
             chrome.addView(createIconView(targetContext, template.icon, iconDrawable, iconSizePx))
             entry.addView(blurLayer)
