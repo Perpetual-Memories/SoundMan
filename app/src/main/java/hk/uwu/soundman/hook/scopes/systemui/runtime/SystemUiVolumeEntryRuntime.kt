@@ -27,12 +27,15 @@ import androidx.core.view.isVisible
 import com.highcapable.kavaref.KavaRef.Companion.resolve
 import com.highcapable.kavaref.extension.toClassOrNull
 import hk.uwu.soundman.R
+import hk.uwu.soundman.hook.scopes.systemui.hidden.ActiveMediaApp
 import hk.uwu.soundman.hook.scopes.systemui.hidden.HyperLightGlassBridge
 import hk.uwu.soundman.hook.scopes.systemui.hidden.OfficialComponentMaterial
 import hk.uwu.soundman.hook.scopes.systemui.hidden.OfficialRingerBlur
 import hk.uwu.soundman.hook.scopes.systemui.hidden.OfficialRingerClone
+import hk.uwu.soundman.hook.scopes.systemui.hidden.SystemUiPlaybackMonitor
 import hk.uwu.soundman.model.EntryMaterial
 import hk.uwu.soundman.model.EntryPosition
+import hk.uwu.soundman.model.MediaPresence
 import hk.uwu.soundman.overlay.OverlayOpenRequest
 import java.lang.ref.WeakReference
 import java.util.WeakHashMap
@@ -58,6 +61,20 @@ class SystemUiVolumeEntryRuntime(
      */
     private val entryPosition: () -> EntryPosition = { EntryPosition.DEFAULT },
     /**
+     * 当前正在播放的媒体应用；`null` 表示探测不可用（反射被拦、binder 抛错等）。
+     *
+     * 入口只在有媒体播放时显示，点击时又把同一份结果当作面板的种子带过去，
+     * 所以「按钮显示」和「面板里真的有应用」用的是同一个判定，不会对不上。
+     */
+    private val activeMediaApps: (Context) -> List<ActiveMediaApp>? = { null },
+    /**
+     * 「入口只在播放时出现」开关是否开启。
+     *
+     * 关掉后入口回到常驻行为：无论有没有播放都显示。读取失败时按开启处理，
+     * 与默认行为一致（用户没改过设置就是开启）。
+     */
+    private val entryPlaybackOnlyEnabled: () -> Boolean = { true },
+    /**
      * 入口圆钮的材质来源。
      *
      * 默认 [EntryMaterial.HYPERLIGHT]：拿得到 HyperLight 就用它的液态玻璃，
@@ -73,6 +90,10 @@ class SystemUiVolumeEntryRuntime(
 ) {
     private val officialDismissHook = SystemUiOfficialDismissHookBridge(log)
     private val hyperLightGlass = HyperLightGlassBridge(log)
+    private val playbackMonitor = SystemUiPlaybackMonitor(
+        onChange = ::onPlaybackConfigChanged,
+        log = { message, throwable -> log(Log.WARN, TAG, message, throwable) },
+    )
     private val builtinPanel = SystemUiBuiltinVolumePanel(
         log = log,
         hookDismiss = officialDismissHook::dismiss,
@@ -434,7 +455,8 @@ class SystemUiVolumeEntryRuntime(
                     )
                     return@Runnable
                 }
-                entry.visibility = SystemUiVolumeEntryLayout.entryVisibility(expanded)
+                val presence = readPresence(root.context)
+                applyEntryVisibility(entry, expanded, presence, "expanded=$expanded")
             } catch (throwable: Throwable) {
                 log(Log.ERROR, TAG, "Volume expand update failed for expanded=$expanded", throwable)
             }
@@ -447,6 +469,89 @@ class SystemUiVolumeEntryRuntime(
     }
 
     private fun findInsertedEntry(root: View): View? = findExistingEntry(root)
+
+    /**
+     * 读取当前媒体播放判定；探测抛错时按 [MediaPresence.UNKNOWN] 处理。
+     *
+     * 动机：入口可见性是个「锦上添花」的判断，探测不可用不能连累入口本身 ——
+     * 藏掉入口等于让整个模块看起来失灵，多显示一颗按钮则只是多一个入口。
+     *
+     * 用户关掉「仅在播放时显示」后直接返回 [MediaPresence.UNKNOWN]：
+     * 该状态下的入口恒显示，等价于彻底跳过播放门控，不用在策略层再加分支。
+     */
+    private fun readPresence(context: Context): MediaPresence {
+        val gating = try {
+            entryPlaybackOnlyEnabled()
+        } catch (throwable: Throwable) {
+            log(
+                Log.WARN,
+                TAG,
+                "Unable to read entry playback-only setting; keeping playback gating on",
+                throwable,
+            )
+            true
+        }
+        if (!gating) return MediaPresence.UNKNOWN
+        return try {
+            MediaPresence.from(activeMediaApps(context))
+        } catch (throwable: Throwable) {
+            log(
+                Log.WARN,
+                TAG,
+                "Unable to probe active media playback; keeping volume entry visible",
+                throwable,
+            )
+            MediaPresence.UNKNOWN
+        }
+    }
+
+    /**
+     * 应用入口可见性并补一条诊断日志。
+     *
+     * 展开态要记进 [expandedStates]：播放回调刷新时没有官方的 timer_layout 可看，
+     * 只能靠上一次官方回调留下的展开态，不能因为刷新就把展开态的入口点亮。
+     */
+    private fun applyEntryVisibility(
+        entry: View,
+        expanded: Boolean,
+        presence: MediaPresence,
+        reason: String,
+    ) {
+        rememberExpanded(entry, expanded)
+        entry.visibility = EntryPresencePolicy.visibility(expanded, presence)
+        if (!EntryPresencePolicy.isVisible(expanded, presence)) {
+            log(
+                Log.INFO,
+                TAG,
+                "[systemui] volume entry hidden ($reason presence=$presence) view=${describeView(entry)}",
+                null,
+            )
+        }
+    }
+
+    /**
+     * 播放配置变化：面板停在屏幕上的时候，开始/停止播放也要重算入口可见性。
+     *
+     * 走每颗入口自己的 UI 线程；入口已经被回收就跳过。
+     */
+    private fun onPlaybackConfigChanged() {
+        val tracked = synchronized(trackedEntries) { ArrayList(trackedEntries) }
+        tracked.forEach { item ->
+            val entry = item.view.get() ?: return@forEach
+            val refresh = Runnable {
+                try {
+                    if (closing.get()) return@Runnable
+                    val presence = readPresence(entry.context)
+                    applyEntryVisibility(entry, expandedOf(entry), presence, "playback-callback")
+                } catch (throwable: Throwable) {
+                    log(Log.ERROR, TAG, "Playback presence refresh failed", throwable)
+                }
+            }
+            if (!entry.post(refresh)) {
+                log(Log.ERROR, TAG, "Playback presence refresh rejected by entry UI thread", null)
+            }
+        }
+    }
 
     fun scheduleInsertion(thisObject: Any?, trigger: String) {
         if (closing.get()) return
@@ -464,6 +569,8 @@ class SystemUiVolumeEntryRuntime(
             lastTriggerLogMillis,
             "[systemui] trigger=$trigger root=${describeView(root)} attached=${root.isAttachedToWindow}",
         )
+        // 面板一呼出会停在屏幕上好几秒，这段时间里的播放变化只有 AudioPlaybackCallback 能看到。
+        playbackMonitor.register(root.context)
         val uiLooper = root.handler?.looper ?: Looper.myLooper()
         if (uiLooper == null) {
             log(Log.ERROR, TAG, "Volume insertion skipped: trigger=$trigger has no UI Looper", null)
@@ -535,6 +642,7 @@ class SystemUiVolumeEntryRuntime(
                         ::attachHyperLightGlass,
                         pluginClassLoader,
                         position,
+                        ::readPresence,
                     )
                 }
             } catch (throwable: Throwable) {
@@ -1093,6 +1201,7 @@ class SystemUiVolumeEntryRuntime(
             attachHyperLightGlass: (View, Int) -> Boolean,
             pluginClassLoader: ClassLoader?,
             position: EntryPosition,
+            presenceOf: (Context) -> MediaPresence,
         ) {
             if (isClosing()) return
             if (!anchor.isLaidOut || anchor.measuredWidth <= 0 || anchor.measuredHeight <= 0) {
@@ -1195,7 +1304,7 @@ class SystemUiVolumeEntryRuntime(
                         placement.index
                     }
                 placement.parent.addView(entry, insertIndex, placement.layoutParams)
-                applyInsertVisibility(entry, template.timerLayout, log)
+                applyInsertVisibility(entry, template.timerLayout, presenceOf, log)
                 if (!track(entry, uiLooper)) {
                     cleanup(entry)
                     return
@@ -1744,14 +1853,42 @@ class SystemUiVolumeEntryRuntime(
         private fun applyInsertVisibility(
             entry: View,
             timerLayout: View?,
+            presenceOf: (Context) -> MediaPresence,
             log: (priority: Int, tag: String, message: String, throwable: Throwable?) -> Unit,
         ) {
-            val expanded = timerLayout != null && timerLayout.isVisible
-            entry.visibility = SystemUiVolumeEntryLayout.entryVisibility(expanded)
-            if (expanded) {
-                log(Log.INFO, TAG, "Volume entry hidden because DND timer_layout is already visible", null)
+            val expanded = isExpanded(timerLayout)
+            rememberExpanded(entry, expanded)
+            val presence = presenceOf(entry.context)
+            entry.visibility = EntryPresencePolicy.visibility(expanded, presence)
+            when {
+                expanded -> log(
+                    Log.INFO,
+                    TAG,
+                    "Volume entry hidden because DND timer_layout is already visible",
+                    null,
+                )
+                presence.hidesEntry -> log(
+                    Log.INFO,
+                    TAG,
+                    "Volume entry hidden because no media app is playing (presence=$presence)",
+                    null,
+                )
             }
         }
+
+        /**
+         * 每颗入口最近一次官方展开态。
+         *
+         * 播放回调刷新可见性时手上没有官方 `timer_layout`，只能沿用上一次
+         * `updateExpandedH` / 插入时的展开态；弱引用跟着入口一起回收。
+         */
+        private val expandedStates = WeakHashMap<View, Boolean>()
+
+        private fun rememberExpanded(entry: View, expanded: Boolean) {
+            expandedStates[entry] = expanded
+        }
+
+        private fun expandedOf(entry: View): Boolean = expandedStates[entry] ?: false
 
         private fun copyMetrics(
             sizeSource: View,

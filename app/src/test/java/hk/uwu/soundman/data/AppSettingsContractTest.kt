@@ -58,6 +58,12 @@ class AppSettingsContractTest {
         assertEquals(AppSettingsDefaults.ENTRY_POSITION, settings.entryPosition)
         assertEquals(EntryPosition.DEFAULT, settings.entryPosition)
         assertEquals(EntryPosition.ABOVE, settings.entryPosition)
+        // 播放门控默认开启：与音质音效官方入口一致，也是该判定首次发布时的行为。
+        assertEquals(
+            AppSettingsDefaults.ENTRY_PLAYBACK_ONLY_ENABLED,
+            settings.entryPlaybackOnlyEnabled,
+        )
+        assertTrue(settings.entryPlaybackOnlyEnabled)
         // 面板玻璃默认跟随 HyperLight：与系统展开面板同一条链路。
         assertEquals(
             AppSettingsDefaults.HYPER_LIGHT_PANEL_GLASS_ENABLED,
@@ -113,12 +119,13 @@ class AppSettingsContractTest {
                 "liquid_glass_blur_radius",
                 "liquid_glass_blend_color",
                 "entry_position",
+                "entry_playback_only_enabled",
                 "entry_material",
                 "hyperlight_panel_glass_enabled",
             ),
             AppSettingsKeys.all,
         )
-        assertEquals(12, AppSettingsKeys.all.size)
+        assertEquals(13, AppSettingsKeys.all.size)
         assertNotEquals(AppSettingsKeys.SMOOTH_CORNERS, AppSettingsKeys.VOLUME_PERCENT)
         assertNotEquals(
             AppSettingsKeys.VOLUME_PERCENT,

@@ -1,5 +1,6 @@
 package hk.uwu.soundman.hook.scopes.systemui
 
+import android.content.Context
 import android.graphics.drawable.Drawable
 import android.util.Log
 import android.view.View
@@ -10,6 +11,8 @@ import hk.uwu.soundman.data.AppSettingsDefaults
 import hk.uwu.soundman.data.AppSettingsKeys
 import hk.uwu.soundman.data.SYSTEM_UI_SETTINGS_PREFERENCES_NAME
 import hk.uwu.soundman.hook.core.YLog
+import hk.uwu.soundman.hook.scopes.systemui.hidden.ActiveMediaApp
+import hk.uwu.soundman.hook.scopes.systemui.hidden.SystemUiMediaPlayback
 import hk.uwu.soundman.hook.scopes.systemui.hidden.SystemUiPluginClassLoader
 import hk.uwu.soundman.hook.scopes.systemui.hidden.SystemUiPluginClassLoaderAttach
 import hk.uwu.soundman.hook.scopes.systemui.hidden.SystemUiPluginHookTargets
@@ -37,9 +40,12 @@ object SystemUiVolumeEntryHooker : YukiBaseHooker() {
         liquidGlassBlurRadius = ::liquidGlassBlurRadius,
         liquidGlassBlendColor = ::liquidGlassBlendColor,
         entryPosition = ::entryPosition,
+        activeMediaApps = ::activeMediaApps,
+        entryPlaybackOnlyEnabled = ::isEntryPlaybackOnlyEnabled,
         entryMaterial = ::entryMaterial,
         hyperLightPanelGlassEnabled = ::isHyperLightPanelGlassEnabled,
     )
+    private val mediaPlayback = SystemUiMediaPlayback(::logPlayback)
     private val pluginClassLoaderReader = SystemUiPluginClassLoader()
     private val pluginClassLoaderAttach = SystemUiPluginClassLoaderAttach()
 
@@ -443,6 +449,26 @@ object SystemUiVolumeEntryHooker : YukiBaseHooker() {
     }
 
     /**
+     * 入口「仅在播放时显示」开关跨进程读取：默认开启，读取失败时按默认处理。
+     *
+     * 关掉后 runtime 会把播放判定当作未知，入口恒显示。
+     */
+    private fun isEntryPlaybackOnlyEnabled(): Boolean = try {
+        val modulePrefs = prefs(SYSTEM_UI_SETTINGS_PREFERENCES_NAME)
+        val value = modulePrefs.all()[AppSettingsKeys.ENTRY_PLAYBACK_ONLY]
+        when (value) {
+            null -> AppSettingsDefaults.ENTRY_PLAYBACK_ONLY_ENABLED
+            is Boolean -> value
+            else -> error(
+                "Invalid ${AppSettingsKeys.ENTRY_PLAYBACK_ONLY} type=${value.javaClass.name}",
+            )
+        }
+    } catch (error: Throwable) {
+        YLog.error("Unable to read entry playback-only setting through Yuki prefs", error)
+        AppSettingsDefaults.ENTRY_PLAYBACK_ONLY_ENABLED
+    }
+
+    /**
      * 「面板跟随 HyperLight 玻璃」开关跨进程读取：默认开启，读取失败时按默认处理。
      *
      * 关掉后面板不再调用 HyperLight 的挂载入口，只保留官方展开材质 + 自研玻璃。
@@ -473,6 +499,23 @@ object SystemUiVolumeEntryHooker : YukiBaseHooker() {
     } catch (error: Throwable) {
         YLog.error("Unable to read entry material setting through Yuki prefs", error)
         EntryMaterial.DEFAULT
+    }
+
+    /**
+     * 当前正在播放的媒体应用；探测失败时返回 null，由 runtime 按「未知」处理。
+     *
+     * 入口可见性和点击时的面板种子共用这一份结果，所以不会出现
+     * 「按钮显示着、点开却是空列表」这种对不上的情况。
+     */
+    private fun activeMediaApps(context: Context): List<ActiveMediaApp>? = try {
+        mediaPlayback.probe(context)
+    } catch (throwable: Throwable) {
+        YLog.error("Unable to probe active media playback", throwable)
+        null
+    }
+
+    private fun logPlayback(message: String, throwable: Throwable?) {
+        YLog.warn("[presence] $message", throwable)
     }
 
     private fun writeLog(priority: Int, tag: String, message: String, throwable: Throwable?) {

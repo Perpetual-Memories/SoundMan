@@ -98,6 +98,9 @@ class MainActivity : ComponentActivity() {
             entryPositionMirror = { position ->
                 SystemUiAppSettingsSync.persistEntryPosition(this, position)
             },
+            entryPlaybackOnlyMirror = { enabled ->
+                SystemUiAppSettingsSync.persistEntryPlaybackOnlyEnabled(this, enabled)
+            },
             entryMaterialMirror = { material ->
                 SystemUiAppSettingsSync.persistEntryMaterial(this, material)
             },
@@ -201,6 +204,17 @@ class MainActivity : ComponentActivity() {
         } catch (error: RuntimeException) {
             AppLog.error(
                 "Unable to synchronize volume entry position during startup",
+                error
+            )
+        }
+        try {
+            SystemUiAppSettingsSync.persistEntryPlaybackOnlyEnabled(
+                this,
+                settingsStore.read().entryPlaybackOnlyEnabled,
+            )
+        } catch (error: RuntimeException) {
+            AppLog.error(
+                "Unable to synchronize entry playback-only setting during startup",
                 error
             )
         }
