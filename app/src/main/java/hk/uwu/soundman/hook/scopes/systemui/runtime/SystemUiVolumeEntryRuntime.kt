@@ -27,6 +27,7 @@ import androidx.core.view.isVisible
 import com.highcapable.kavaref.KavaRef.Companion.resolve
 import com.highcapable.kavaref.extension.toClassOrNull
 import hk.uwu.soundman.R
+import hk.uwu.soundman.data.PanelBridgePrewarm
 import hk.uwu.soundman.hook.scopes.systemui.hidden.ActiveMediaApp
 import hk.uwu.soundman.hook.scopes.systemui.hidden.HyperLightGlassBridge
 import hk.uwu.soundman.hook.scopes.systemui.hidden.OfficialComponentMaterial
@@ -37,6 +38,7 @@ import hk.uwu.soundman.model.EntryMaterial
 import hk.uwu.soundman.model.EntryPosition
 import hk.uwu.soundman.model.MediaPresence
 import hk.uwu.soundman.overlay.OverlayOpenRequest
+import hk.uwu.soundman.overlay.SeededPlayback
 import java.lang.ref.WeakReference
 import java.util.WeakHashMap
 import java.util.concurrent.atomic.AtomicBoolean
@@ -376,11 +378,33 @@ class SystemUiVolumeEntryRuntime(
     }
 
     /**
+     * 把刚探测到的正在播放的应用打包成面板种子。
+     *
+     * 动机：面板进程要连宿主做一次握手才有列表，冷启动那几百毫秒里列表是空的。
+     * 侧栏为了决定「显示不显示入口」刚刚探测过一次，这份结果直接带过去当首帧占位，
+     * 用户点开立刻就能看到音量条，而不是先空一下再刷出来。
+     *
+     * 包名查不到（共享 uid 且无包）的应用没法画图标，直接丢掉：种子只是占位，
+     * 少一条不影响宿主快照到达后的真实列表。
+     */
+    private fun seededPlayback(context: Context): List<SeededPlayback> = try {
+        activeMediaApps(context)
+            ?.mapNotNull { app ->
+                val packageName = app.packageName?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                SeededPlayback(app.uid, packageName)
+            }
+            ?: emptyList()
+    } catch (throwable: Throwable) {
+        log(Log.WARN, TAG, "Unable to seed panel playback list; opening without it", throwable)
+        emptyList()
+    }
+
+    /**
      * 从 SystemUI/插件进程打开 SoundMan 面板，并关掉音量侧栏。
      */
     fun openOverlay(context: Context, trigger: String, sourceView: View) {
         if (closing.get()) return
-        val launch = OverlayOpenRequest.sidebarActivityLaunch()
+        val launch = OverlayOpenRequest.sidebarActivityLaunch(seededPlayback(context))
         val intent = Intent(launch.action)
             .setComponent(ComponentName(launch.packageName, launch.className))
             .addFlags(launch.flags)
@@ -571,6 +595,9 @@ class SystemUiVolumeEntryRuntime(
         )
         // 面板一呼出会停在屏幕上好几秒，这段时间里的播放变化只有 AudioPlaybackCallback 能看到。
         playbackMonitor.register(root.context)
+        // 侧栏已经出来了，用户还没点到按钮：趁这几百毫秒把面板要用的宿主握手跑完，
+        // 免得点开时面板先空一帧再刷出来。
+        prewarmPanelBridge(root)
         val uiLooper = root.handler?.looper ?: Looper.myLooper()
         if (uiLooper == null) {
             log(Log.ERROR, TAG, "Volume insertion skipped: trigger=$trigger has no UI Looper", null)
@@ -673,6 +700,21 @@ class SystemUiVolumeEntryRuntime(
             null,
         )
         queueInsertionAttempt(pending)
+    }
+
+    /**
+     * 后台预热面板桥接；失败只是回到原来的等待，不能影响入口本身。
+     *
+     * @param root 侧栏根 View，用它的 context 解析模块 Provider
+     */
+    private fun prewarmPanelBridge(root: View) {
+        try {
+            PanelBridgePrewarm.warm(root.context) { message, error ->
+                log(Log.DEBUG, TAG, message, error)
+            }
+        } catch (throwable: Throwable) {
+            log(Log.WARN, TAG, "Unable to prewarm panel bridge", throwable)
+        }
     }
 
     private fun resolveAnchor(root: View): AnchorMatch? = findAnchorByResource(root)
